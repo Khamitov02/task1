@@ -171,6 +171,8 @@ void RunClient() {
     SOCKET ConnectSocket = INVALID_SOCKET;
     struct addrinfo *result = NULL, hints;
     char buffer[BUFFER_SIZE];
+    char inputBuffer[BUFFER_SIZE] = {0};
+    int inputPos = 0;
     int key;
 
     ZeroMemory(&hints, sizeof(hints));
@@ -206,39 +208,60 @@ void RunClient() {
     u_long mode = 1;
     ioctlsocket(ConnectSocket, FIONBIO, &mode);
 
-    log_message("Starting input loop. Press Ctrl+C to exit.");
+    log_message("Starting SSH-like console. Press Ctrl+C to exit.");
+    printf("Remote console ready. Type commands and press Enter.\n");
     
-    // Handle keyboard input and socket communication
     while (1) {
         if (_kbhit()) {
             key = _getch();
             
-            // Handle special keys if needed
+            // Handle special keys
             if (key == 0 || key == 224) {
                 key = _getch(); // Get the second byte of special keys
                 continue;
             }
             
-            // Echo the character locally
-            if (isprint(key) || key == '\r' || key == '\n' || key == '\b') {
-                printf("%c", key);
-                if (key == '\r') printf("\n");
+            // Handle backspace
+            if (key == '\b' && inputPos > 0) {
+                printf("\b \b");  // Erase character from screen
+                inputPos--;
+                inputBuffer[inputPos] = 0;
+                continue;
             }
             
-            // Send the key to server
-            if (send(ConnectSocket, (char*)&key, 1, 0) == SOCKET_ERROR) {
-                if (WSAGetLastError() != WSAEWOULDBLOCK) {
-                    log_message("ERROR: Failed to send data");
-                    break;
+            // Handle enter key
+            if (key == '\r') {
+                inputBuffer[inputPos] = '\n';
+                inputPos++;
+                printf("\n");
+                
+                // Send the complete command
+                if (send(ConnectSocket, inputBuffer, inputPos, 0) == SOCKET_ERROR) {
+                    if (WSAGetLastError() != WSAEWOULDBLOCK) {
+                        log_message("ERROR: Failed to send command");
+                        break;
+                    }
                 }
+                
+                // Reset input buffer
+                memset(inputBuffer, 0, BUFFER_SIZE);
+                inputPos = 0;
+                continue;
+            }
+            
+            // Handle regular characters
+            if (inputPos < BUFFER_SIZE - 2 && isprint(key)) {
+                inputBuffer[inputPos++] = key;
+                printf("%c", key);  // Echo character
             }
         }
 
-        // Check for server response with non-blocking recv
+        // Check for server response
         int bytesReceived = recv(ConnectSocket, buffer, BUFFER_SIZE - 1, 0);
         if (bytesReceived > 0) {
             buffer[bytesReceived] = '\0';
             printf("%s", buffer);
+            fflush(stdout);
         } else if (bytesReceived == SOCKET_ERROR) {
             if (WSAGetLastError() != WSAEWOULDBLOCK) {
                 log_message("ERROR: Connection closed");
@@ -246,7 +269,6 @@ void RunClient() {
             }
         }
 
-        // Small sleep to prevent CPU overload
         Sleep(10);
     }
 
@@ -261,13 +283,29 @@ DWORD WINAPI PipeToSocket(LPVOID lpParam) {
     DWORD dwRead;
     DWORD totalBytes = 0;
 
-    while (ReadFile(pData->pipe, buffer, BUFFER_SIZE, &dwRead, NULL)) {
+    while (ReadFile(pData->pipe, buffer, BUFFER_SIZE - 1, &dwRead, NULL)) {
         if (dwRead > 0) {
-            send(pData->socket, buffer, dwRead, 0);
+            buffer[dwRead] = '\0';  // Ensure null termination
+            
+            int bytesSent = 0;
+            while (bytesSent < dwRead) {
+                int result = send(pData->socket, buffer + bytesSent, dwRead - bytesSent, 0);
+                if (result == SOCKET_ERROR) {
+                    if (WSAGetLastError() != WSAEWOULDBLOCK) {
+                        log_message("ERROR: Failed to send data to socket");
+                        return 1;
+                    }
+                    Sleep(10);  // Wait a bit if would block
+                    continue;
+                }
+                bytesSent += result;
+            }
+            
             totalBytes += dwRead;
             log_message("Sent %d bytes from pipe to socket (total: %d)", dwRead, totalBytes);
         }
     }
+    
     log_message("PipeToSocket thread ending");
     return 0;
 }
@@ -280,11 +318,21 @@ DWORD WINAPI SocketToPipe(LPVOID lpParam) {
     DWORD dwWritten;
     DWORD totalBytes = 0;
 
-    while ((bytesReceived = recv(pData->socket, buffer, BUFFER_SIZE, 0)) > 0) {
-        WriteFile(pData->pipe, buffer, bytesReceived, &dwWritten, NULL);
+    while ((bytesReceived = recv(pData->socket, buffer, BUFFER_SIZE - 1, 0)) > 0) {
+        // Ensure command ends with newline
+        if (buffer[bytesReceived-1] != '\n') {
+            buffer[bytesReceived] = '\n';
+            bytesReceived++;
+        }
+        
+        if (!WriteFile(pData->pipe, buffer, bytesReceived, &dwWritten, NULL)) {
+            log_message("ERROR: Failed to write to pipe");
+            break;
+        }
         totalBytes += bytesReceived;
         log_message("Wrote %d bytes from socket to pipe (total: %d)", bytesReceived, totalBytes);
     }
+
     log_message("SocketToPipe thread ending");
     return 0;
 }
