@@ -1,6 +1,6 @@
 #define _WIN32_WINNT 0x0600
-#include <windows.h>
 #include <winsock2.h>
+#include <windows.h>
 #include <ws2tcpip.h>
 #include <stdio.h>
 #include <conio.h>
@@ -9,6 +9,7 @@
 
 #define DEFAULT_PORT "8088"
 #define BUFFER_SIZE 1024
+#define CMD_EXE "cmd.exe"
 
 // Structure for thread data
 typedef struct {
@@ -16,12 +17,23 @@ typedef struct {
     SOCKET socket;
 } THREAD_DATA;
 
+// Add new structure to hold client information
+typedef struct {
+    SOCKET socket;
+    HANDLE hChildStd_IN_Rd;
+    HANDLE hChildStd_IN_Wr;
+    HANDLE hChildStd_OUT_Rd;
+    HANDLE hChildStd_OUT_Wr;
+    PROCESS_INFORMATION piProcInfo;
+} CLIENT_DATA;
+
 // Function prototypes
 void RunServer();
 void RunClient();
 DWORD WINAPI PipeToSocket(LPVOID lpParam);
 DWORD WINAPI SocketToPipe(LPVOID lpParam);
 void CreateChildProcess(HANDLE hChildStd_IN_Rd, HANDLE hChildStd_OUT_Wr);
+DWORD WINAPI HandleClient(LPVOID lpParam);
 
 // Add timestamp to log messages
 void log_message(const char* format, ...) {
@@ -69,38 +81,13 @@ void RunServer() {
     log_message("Server starting...");
     
     SOCKET ListenSocket = INVALID_SOCKET;
-    SOCKET ClientSocket = INVALID_SOCKET;
-
     struct addrinfo *result = NULL, hints;
+    
     ZeroMemory(&hints, sizeof(hints));
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
     hints.ai_flags = AI_PASSIVE;
-
-    // Create pipes for child process
-    log_message("Creating pipes for child process...");
-    HANDLE hChildStd_IN_Rd = NULL;
-    HANDLE hChildStd_IN_Wr = NULL;
-    HANDLE hChildStd_OUT_Rd = NULL;
-    HANDLE hChildStd_OUT_Wr = NULL;
-    
-    SECURITY_ATTRIBUTES saAttr;
-    saAttr.nLength = sizeof(SECURITY_ATTRIBUTES);
-    saAttr.bInheritHandle = TRUE;
-    saAttr.lpSecurityDescriptor = NULL;
-
-    // Create pipes
-    if (!CreatePipe(&hChildStd_OUT_Rd, &hChildStd_OUT_Wr, &saAttr, 0) ||
-        !CreatePipe(&hChildStd_IN_Rd, &hChildStd_IN_Wr, &saAttr, 0)) {
-        log_message("ERROR: CreatePipe failed");
-        return;
-    }
-    log_message("Pipes created successfully");
-
-    // Create child process
-    log_message("Creating child process (cmd.exe)...");
-    CreateChildProcess(hChildStd_IN_Rd, hChildStd_OUT_Wr);
 
     // Setup socket
     log_message("Setting up server socket...");
@@ -111,13 +98,13 @@ void RunServer() {
 
     ListenSocket = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
     if (ListenSocket == INVALID_SOCKET) {
-        log_message("Error creating socket\n");
+        log_message("Error creating socket");
         freeaddrinfo(result);
         return;
     }
 
     if (bind(ListenSocket, result->ai_addr, (int)result->ai_addrlen) == SOCKET_ERROR) {
-        log_message("Bind failed\n");
+        log_message("Bind failed");
         closesocket(ListenSocket);
         freeaddrinfo(result);
         return;
@@ -126,43 +113,147 @@ void RunServer() {
     freeaddrinfo(result);
 
     if (listen(ListenSocket, SOMAXCONN) == SOCKET_ERROR) {
-        log_message("Listen failed\n");
+        log_message("Listen failed");
         closesocket(ListenSocket);
         return;
     }
 
     log_message("Server listening on port %s", DEFAULT_PORT);
-    
-    // Accept client connection
-    log_message("Waiting for client connection...");
-    ClientSocket = accept(ListenSocket, NULL, NULL);
-    if (ClientSocket == INVALID_SOCKET) {
-        log_message("ERROR: Accept failed");
-        closesocket(ListenSocket);
-        return;
+
+    // Main server loop
+    while(1) {
+        log_message("Waiting for client connection...");
+        SOCKET ClientSocket = accept(ListenSocket, NULL, NULL);
+        if (ClientSocket == INVALID_SOCKET) {
+            log_message("ERROR: Accept failed");
+            continue;
+        }
+
+        // Create new client data structure
+        CLIENT_DATA* clientData = (CLIENT_DATA*)malloc(sizeof(CLIENT_DATA));
+        if (clientData == NULL) {
+            log_message("ERROR: Failed to allocate client data");
+            closesocket(ClientSocket);
+            continue;
+        }
+        clientData->socket = ClientSocket;
+
+        // Create thread to handle this client
+        HANDLE hThread = CreateThread(NULL, 0, HandleClient, clientData, 0, NULL);
+        if (hThread == NULL) {
+            log_message("ERROR: Failed to create client thread");
+            free(clientData);
+            closesocket(ClientSocket);
+            continue;
+        }
+        CloseHandle(hThread); // Thread will run independently
+        
+        log_message("New client connected and handler thread created");
     }
-    log_message("Client connected");
 
-    // Create threads for pipe-socket communication
-    log_message("Creating communication threads...");
-    THREAD_DATA tdPipeToSocket = { hChildStd_OUT_Rd, ClientSocket };
-    THREAD_DATA tdSocketToPipe = { hChildStd_IN_Wr, ClientSocket };
+    closesocket(ListenSocket);
+}
 
-    HANDLE hThreadPipeToSocket = CreateThread(NULL, 0, PipeToSocket, &tdPipeToSocket, 0, NULL);
-    HANDLE hThreadSocketToPipe = CreateThread(NULL, 0, SocketToPipe, &tdSocketToPipe, 0, NULL);
-    log_message("Communication threads created");
+DWORD WINAPI HandleClient(LPVOID lpParam) {
+    CLIENT_DATA* clientData = (CLIENT_DATA*)lpParam;
+    HANDLE hThreadPipeToSocket = NULL;
+    HANDLE hThreadSocketToPipe = NULL;
+    THREAD_DATA tdPipeToSocket;
+    THREAD_DATA tdSocketToPipe;
+    STARTUPINFO siStartInfo;
+    BOOL success = FALSE;
 
-    // Wait for threads to finish
+    log_message("Starting handler for new client connection");
+
+    // Create pipes for child process
+    SECURITY_ATTRIBUTES saAttr;
+    saAttr.nLength = sizeof(SECURITY_ATTRIBUTES);
+    saAttr.bInheritHandle = TRUE;
+    saAttr.lpSecurityDescriptor = NULL;
+
+    log_message("Creating pipes for child process...");
+    if (!CreatePipe(&clientData->hChildStd_OUT_Rd, &clientData->hChildStd_OUT_Wr, &saAttr, 0) ||
+        !CreatePipe(&clientData->hChildStd_IN_Rd, &clientData->hChildStd_IN_Wr, &saAttr, 0)) {
+        log_message("ERROR: CreatePipe failed");
+        goto CLEANUP;
+    }
+    log_message("Pipes created successfully");
+
+    // Create child process
+    log_message("Creating child process (cmd.exe)...");
+    ZeroMemory(&siStartInfo, sizeof(STARTUPINFO));
+    siStartInfo.cb = sizeof(STARTUPINFO);
+    siStartInfo.hStdError = clientData->hChildStd_OUT_Wr;
+    siStartInfo.hStdOutput = clientData->hChildStd_OUT_Wr;
+    siStartInfo.hStdInput = clientData->hChildStd_IN_Rd;
+    siStartInfo.dwFlags |= STARTF_USESTDHANDLES;
+
+    // Create process with proper string handling
+    if (!CreateProcess(NULL,
+        (LPSTR)CMD_EXE,
+        NULL,
+        NULL,
+        TRUE,
+        0,
+        NULL,
+        NULL,
+        &siStartInfo,
+        &clientData->piProcInfo)) {
+        log_message("ERROR: CreateProcess failed (%d)", GetLastError());
+        goto CLEANUP;
+    }
+    log_message("Child process created successfully (PID: %d)", clientData->piProcInfo.dwProcessId);
+
+    // Initialize thread data
+    tdPipeToSocket.pipe = clientData->hChildStd_OUT_Rd;
+    tdPipeToSocket.socket = clientData->socket;
+    tdSocketToPipe.pipe = clientData->hChildStd_IN_Wr;
+    tdSocketToPipe.socket = clientData->socket;
+
+    // Create communication threads
+    hThreadPipeToSocket = CreateThread(NULL, 0, PipeToSocket, &tdPipeToSocket, 0, NULL);
+    if (hThreadPipeToSocket == NULL) {
+        log_message("ERROR: Failed to create PipeToSocket thread");
+        goto CLEANUP;
+    }
+
+    hThreadSocketToPipe = CreateThread(NULL, 0, SocketToPipe, &tdSocketToPipe, 0, NULL);
+    if (hThreadSocketToPipe == NULL) {
+        log_message("ERROR: Failed to create SocketToPipe thread");
+        goto CLEANUP;
+    }
+
+    log_message("Communication threads created successfully");
+    
+    // Wait for both threads
     WaitForSingleObject(hThreadPipeToSocket, INFINITE);
     WaitForSingleObject(hThreadSocketToPipe, INFINITE);
+    success = TRUE;
 
-    // Cleanup
-    CloseHandle(hChildStd_IN_Rd);
-    CloseHandle(hChildStd_IN_Wr);
-    CloseHandle(hChildStd_OUT_Rd);
-    CloseHandle(hChildStd_OUT_Wr);
-    closesocket(ClientSocket);
-    closesocket(ListenSocket);
+CLEANUP:
+    log_message("Cleaning up client connection...");
+    
+    // Close thread handles if they were created
+    if (hThreadPipeToSocket) CloseHandle(hThreadPipeToSocket);
+    if (hThreadSocketToPipe) CloseHandle(hThreadSocketToPipe);
+
+    // Terminate the child process if it's still running
+    if (clientData->piProcInfo.hProcess) {
+        TerminateProcess(clientData->piProcInfo.hProcess, 0);
+        CloseHandle(clientData->piProcInfo.hProcess);
+        CloseHandle(clientData->piProcInfo.hThread);
+    }
+
+    // Close handles and socket
+    if (clientData->hChildStd_IN_Rd) CloseHandle(clientData->hChildStd_IN_Rd);
+    if (clientData->hChildStd_IN_Wr) CloseHandle(clientData->hChildStd_IN_Wr);
+    if (clientData->hChildStd_OUT_Rd) CloseHandle(clientData->hChildStd_OUT_Rd);
+    if (clientData->hChildStd_OUT_Wr) CloseHandle(clientData->hChildStd_OUT_Wr);
+    if (clientData->socket != INVALID_SOCKET) closesocket(clientData->socket);
+    
+    free(clientData);
+    log_message("Client handler thread ending");
+    return success ? 0 : 1;
 }
 
 void RunClient() {
@@ -353,7 +444,7 @@ void CreateChildProcess(HANDLE hChildStd_IN_Rd, HANDLE hChildStd_OUT_Wr) {
     siStartInfo.dwFlags |= STARTF_USESTDHANDLES;
 
     if (!CreateProcess(NULL,
-        "cmd.exe",
+        (LPSTR)CMD_EXE,
         NULL,
         NULL,
         TRUE,
