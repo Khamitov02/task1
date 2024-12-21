@@ -202,22 +202,55 @@ void RunClient() {
 
     freeaddrinfo(result);
 
+    // Set socket to non-blocking mode
+    u_long mode = 1;
+    ioctlsocket(ConnectSocket, FIONBIO, &mode);
+
+    log_message("Starting input loop. Press Ctrl+C to exit.");
+    
     // Handle keyboard input and socket communication
     while (1) {
         if (_kbhit()) {
             key = _getch();
-            printf("%c", key);
-            send(ConnectSocket, (char*)&key, 1, 0);
+            
+            // Handle special keys if needed
+            if (key == 0 || key == 224) {
+                key = _getch(); // Get the second byte of special keys
+                continue;
+            }
+            
+            // Echo the character locally
+            if (isprint(key) || key == '\r' || key == '\n' || key == '\b') {
+                printf("%c", key);
+                if (key == '\r') printf("\n");
+            }
+            
+            // Send the key to server
+            if (send(ConnectSocket, (char*)&key, 1, 0) == SOCKET_ERROR) {
+                if (WSAGetLastError() != WSAEWOULDBLOCK) {
+                    log_message("ERROR: Failed to send data");
+                    break;
+                }
+            }
         }
 
-        // Check for server response
-        int bytesReceived = recv(ConnectSocket, buffer, BUFFER_SIZE, 0);
+        // Check for server response with non-blocking recv
+        int bytesReceived = recv(ConnectSocket, buffer, BUFFER_SIZE - 1, 0);
         if (bytesReceived > 0) {
             buffer[bytesReceived] = '\0';
             printf("%s", buffer);
+        } else if (bytesReceived == SOCKET_ERROR) {
+            if (WSAGetLastError() != WSAEWOULDBLOCK) {
+                log_message("ERROR: Connection closed");
+                break;
+            }
         }
+
+        // Small sleep to prevent CPU overload
+        Sleep(10);
     }
 
+    log_message("Client shutting down");
     closesocket(ConnectSocket);
 }
 
